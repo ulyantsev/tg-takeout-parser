@@ -26,6 +26,26 @@ CHAT_RECORDS = {'id': 'category',
 
 CHAT_RECORDS_PREFIX = 'chat_'
 
+def load_takeout_json(filename: str) -> dict:
+    pass
+
+def normalize_text_value(t_value,
+                         replace_links=True) -> str:
+    """
+    In TG takeout the majority of message->text values are just strings,
+    but some of them are lists of elements with 'type' field (like links, bold, etc).
+    So for more accurate statistics we need to normalize them to strings and replace links with placeholders
+    :param t_value: a string or a list of strings or dicts with 'type' field
+    :param replace_links: replace links with placeholders
+    :return: a normalized string
+    """
+
+    def elem_f(e): return f"<<{e['type']}>>" if (replace_links and e['type'] == 'link') else e['text']
+
+    if isinstance(t_value, list):
+        return ' '.join([t if isinstance(t, str) else elem_f(t) for t in t_value])
+    return t_value
+
 def gen_messages_dataframe(jdata,
                            chat_types=None,
                            print_stats=False) -> pd.DataFrame:
@@ -67,18 +87,21 @@ def gen_messages_dataframe(jdata,
                            meta_prefix=CHAT_RECORDS_PREFIX,
                            errors="ignore")
 
+    # leaving only selected columns
+    chat_columns_types = {f'{CHAT_RECORDS_PREFIX}{k}': v for k, v in CHAT_RECORDS.items()}
+    columns_types = {**chat_columns_types, **MESSAGE_RECORDS}
+    df = df[list(columns_types.keys())]
+
     df = df[df[f'{CHAT_RECORDS_PREFIX}type'].isin(chat_types)]
 
     # removing service messages and other non-message records
     df = df[df['type'] == 'message']
 
+    df['text'] = df['text'].apply(normalize_text_value)
+
     # removing 'user' prefix from 'from_id' fields
     df['from_id'] = df['from_id'].str.replace('user', '')
     df['from_id'] = df['from_id'].astype('uint64')
-
-    chat_columns_types = {f'{CHAT_RECORDS_PREFIX}{k}': v for k, v in CHAT_RECORDS.items()}
-    columns_types = {**chat_columns_types, **MESSAGE_RECORDS}
-    df = df[list(columns_types.keys())]
 
     # decreasing memory usage by converting to categorical when possible
     # df.convert_dtypes() is not working for categorical automatically
@@ -91,40 +114,48 @@ def gen_messages_dataframe(jdata,
 
     return df
 
-def gen_stats_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+def gen_stats_dataframe(df: pd.DataFrame,
+                        exclude_forwarded=False,
+                        freq="M") -> pd.DataFrame:
     """
     Generate dataframe with stats aggregated from dataframe with messages
     """
+    stat_df = df
+    if exclude_forwarded:
+        stat_df = stat_df[stat_df['forwarded_from'].isna()]
+
     agg_functions = {f'{CHAT_RECORDS_PREFIX}id': 'nunique',
                      'id': 'count',
                      'text': lambda x: np.sum(x.str.len())}
-    stat_df = df.groupby(df.date.dt.to_period("M")).agg(agg_functions)
-    print(stat_df.to_string())
+    stat_df = stat_df.groupby(stat_df.date.dt.to_period(freq)).agg(agg_functions)
+    stat_df.columns = ['chats', 'messages', 'chars']
     return stat_df
 
 
 def gen_plotly_fig(df: pd.DataFrame) -> go.Figure:
     """
     Generate plotly figure from dataframe with messages
-    x axis is date
-    y axis is number of messages
+    :param df: dataframe with stats
     """
 
 
 if __name__ == '__main__':
     if len(sys.argv) != 2:
-        print("Usage: python3 tg-stats.py <result.json>")
+        print("Usage: python3 tg-takeout-parser.py <result.json>")
         sys.exit()
 
     with open(sys.argv[1], encoding='utf-8') as result_file:
+
+        # this could be done with iterative parsing, but it's not needed for now
         jdata = json.load(result_file)
+
         my_id = jdata['personal_information']['user_id']
         print(f"my_id: {my_id}")
 
         df = gen_messages_dataframe(jdata)
         print(set(df['from_id']))
 
-        print("Sent stats:")
-        stat_df = gen_stats_dataframe(df[df['from_id'] == my_id])
-        print("Received stats:")
-        gen_stats_dataframe(df[df['from_id'] != my_id])
+        sent_df = gen_stats_dataframe(df[df['from_id'] == my_id], freq='Q', exclude_forwarded=True)
+        received_df = gen_stats_dataframe(df[df['from_id'] != my_id], freq='Q')
+
+        print(sent_df.merge(received_df, on='date', suffixes=('_sent', '_received')).to_string())

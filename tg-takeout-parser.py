@@ -1,7 +1,9 @@
 # author: @ulyantsev
 
 import json
+import ijson
 import sys
+import time
 
 import numpy as np
 import pandas as pd
@@ -10,6 +12,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+CHAT_TYPES = ['private_group', 'personal_chat']
 
 MESSAGE_RECORDS = {'id': 'int',
                    'date': 'datetime64[ns]',
@@ -18,6 +21,7 @@ MESSAGE_RECORDS = {'id': 'int',
                    'text': 'string',
                    'forwarded_from': 'category',
                    'media_type': 'category',
+                   'duration_seconds': 'Int64',
                    'file': 'category'}
 
 CHAT_RECORDS = {'id': 'category',
@@ -26,27 +30,50 @@ CHAT_RECORDS = {'id': 'category',
 
 CHAT_RECORDS_PREFIX = 'chat_'
 
-def load_takeout_json(filename: str) -> dict:
-    pass
+STAT_FUNCTIONS = {f'{CHAT_RECORDS_PREFIX}id': 'nunique',
+                  'id': 'count',
+                  'text': lambda x: np.sum(x.str.len()),
+                  'duration_seconds': 'sum'}
 
-def normalize_text_value(t_value,
+STAT_COLUMNS_NAMES = ['chats', 'msg', 'chr', 'media_sec']
+
+def load_selected_msg_data(json_path: str):
+    with open(json_path, encoding='utf-8') as result_file:
+        result_file.seek(0)
+        objects = ijson.items(result_file, 'chats.list.item')
+        chats = (o for o in objects if o['type'] in CHAT_TYPES)
+        res = []
+        for chat in chats:
+            c = {k: v for k, v in chat.items() if k in CHAT_RECORDS}
+            c['messages'] = [{k: v for k, v in m.items() if k in MESSAGE_RECORDS} for m in chat['messages']]
+            res.append(c)
+        return res
+
+def load_my_id(json_path: str):
+    with open(json_path, encoding='utf-8') as result_file:
+        objects = ijson.items(result_file, 'personal_information')
+        return next(objects)['user_id']
+
+
+def normalize_text_value(value,
                          replace_links=True) -> str:
     """
     In TG takeout the majority of message->text values are just strings,
-    but some of them are lists of elements with 'type' field (like links, bold, etc).
+    but some of them are lists of elements with 'type' field (like links, bold, etc.).
     So for more accurate statistics we need to normalize them to strings and replace links with placeholders
-    :param t_value: a string or a list of strings or dicts with 'type' field
+    :param value: a string or a list of strings or dicts with 'type' field
     :param replace_links: replace links with placeholders
     :return: a normalized string
     """
 
     def elem_f(e): return f"<<{e['type']}>>" if (replace_links and e['type'] == 'link') else e['text']
 
-    if isinstance(t_value, list):
-        return ' '.join([t if isinstance(t, str) else elem_f(t) for t in t_value])
-    return t_value
+    if isinstance(value, list):
+        return ' '.join([t if isinstance(t, str) else elem_f(t) for t in value])
+    return value
 
-def gen_messages_dataframe(jdata,
+
+def gen_messages_dataframe(chats_list,
                            chat_types=None,
                            print_stats=False) -> pd.DataFrame:
     """
@@ -79,9 +106,9 @@ def gen_messages_dataframe(jdata,
     """
 
     if chat_types is None:
-        chat_types = ['private_group', 'personal_chat']
+        chat_types = CHAT_TYPES
 
-    df = pd.json_normalize(jdata["chats"]["list"],
+    df = pd.json_normalize(chats_list,
                            record_path="messages",
                            meta=["name", "id", "type"],
                            meta_prefix=CHAT_RECORDS_PREFIX,
@@ -90,7 +117,7 @@ def gen_messages_dataframe(jdata,
     # leaving only selected columns
     chat_columns_types = {f'{CHAT_RECORDS_PREFIX}{k}': v for k, v in CHAT_RECORDS.items()}
     columns_types = {**chat_columns_types, **MESSAGE_RECORDS}
-    df = df[list(columns_types.keys())]
+    df = df.reindex(list(columns_types.keys()))
 
     df = df[df[f'{CHAT_RECORDS_PREFIX}type'].isin(chat_types)]
 
@@ -114,6 +141,7 @@ def gen_messages_dataframe(jdata,
 
     return df
 
+
 def gen_stats_dataframe(df: pd.DataFrame,
                         exclude_forwarded=False,
                         freq="M") -> pd.DataFrame:
@@ -124,19 +152,24 @@ def gen_stats_dataframe(df: pd.DataFrame,
     if exclude_forwarded:
         stat_df = stat_df[stat_df['forwarded_from'].isna()]
 
-    agg_functions = {f'{CHAT_RECORDS_PREFIX}id': 'nunique',
-                     'id': 'count',
-                     'text': lambda x: np.sum(x.str.len())}
-    stat_df = stat_df.groupby(stat_df.date.dt.to_period(freq)).agg(agg_functions)
-    stat_df.columns = ['chats', 'messages', 'chars']
+    stat_df = stat_df.groupby(stat_df.date.dt.to_period(freq)).agg(STAT_FUNCTIONS)
+    stat_df.columns = STAT_COLUMNS_NAMES
     return stat_df
 
 
-def gen_plotly_fig(df: pd.DataFrame) -> go.Figure:
+def gen_stat_plotly_fig(df: pd.DataFrame) -> go.Figure:
     """
     Generate plotly figure from dataframe with messages
     :param df: dataframe with stats
     """
+    # sent_df = gen_stats_dataframe(df[df['from_id'] == my_id], exclude_forwarded=True)
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    # fig.add_trace(go.Bar(x=merged_df.index.to_timestamp(), y=merged_df['chr_sent'], name='chr'), secondary_y=False)
+    # fig.add_trace(go.Bar(x=merged_df.index.to_timestamp(), y=merged_df['len_received'], name='received'),
+    #               secondary_y=False)
+    # fig.add_trace(go.Scatter(x=merged_df.index.to_timestamp(), y=merged_df['msg_sent'], name='msg'), secondary_y=True)
+    return fig
 
 
 if __name__ == '__main__':
@@ -144,18 +177,32 @@ if __name__ == '__main__':
         print("Usage: python3 tg-takeout-parser.py <result.json>")
         sys.exit()
 
-    with open(sys.argv[1], encoding='utf-8') as result_file:
+    start_time = time.time()
 
-        # this could be done with iterative parsing, but it's not needed for now
-        jdata = json.load(result_file)
+    # with open(sys.argv[1], encoding='utf-8') as result_file:
+    #     jdata = json.load(result_file)
+    with open('x.json', 'w', encoding='utf-8') as f:
+        f.write(str(load_selected_msg_data(sys.argv[1])))
+        print(load_my_id(sys.argv[1]))
 
-        my_id = jdata['personal_information']['user_id']
-        print(f"my_id: {my_id}")
 
-        df = gen_messages_dataframe(jdata)
-        print(set(df['from_id']))
+    print("--- %s seconds ---" % (time.time() - start_time))
 
-        sent_df = gen_stats_dataframe(df[df['from_id'] == my_id], freq='Q', exclude_forwarded=True)
-        received_df = gen_stats_dataframe(df[df['from_id'] != my_id], freq='Q')
+    # with open(sys.argv[1], encoding='utf-8') as result_file:
+    #
+    #     # this could be done with iterative parsing, but it's not needed for now
+    #     jdata = json.load(result_file)
+    #
+    #     my_id = jdata['personal_information']['user_id']
+    #
+    #     df = gen_messages_dataframe(jdata)
+    #     print(df.head(15).to_string())
+    #
+    #     sent_df = gen_stats_dataframe(df[df['from_id'] == my_id], exclude_forwarded=True)
+    #     received_df = gen_stats_dataframe(df[df['from_id'] != my_id])
+    #
+    #     merged_df = sent_df.merge(received_df, on='date', suffixes=('_sent', '_received'))
+    #     print(merged_df)
 
-        print(sent_df.merge(received_df, on='date', suffixes=('_sent', '_received')).to_string())
+
+

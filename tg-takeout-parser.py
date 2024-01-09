@@ -1,4 +1,7 @@
+# A simple script to parse telegram takeout json file to pandas dataframe and generate some statistics and plots.
+# Free to use, no warranty, no license. Modify as you wish.
 # author: @ulyantsev
+import datetime
 
 import ijson
 import sys
@@ -142,28 +145,47 @@ def gen_stats_dataframe(df: pd.DataFrame,
     stat_df.columns = STAT_COLUMNS_NAMES
     return stat_df
 
-def gen_sent_received_dataframe(msg_df: pd.DataFrame, my_id) -> pd.DataFrame:
+
+def gen_sent_received_dataframe(msg_df: pd.DataFrame, my_id: int) -> pd.DataFrame:
+    """
+    Generate dataframe with separated stats for sent and received messages.
+    :param msg_df: dataframe with messages
+    :param my_id: owner id number
+    :return: dataframe with stats
+    """
     sent_df = gen_stats_dataframe(msg_df[msg_df['from_id'] == my_id], exclude_forwarded=True)
     received_df = gen_stats_dataframe(msg_df[msg_df['from_id'] != my_id])
     return sent_df.merge(received_df, on='date', suffixes=('_sent', '_received'))
 
 
-def gen_stat_plotly_fig(msg_df: pd.DataFrame, my_id: int) -> go.Figure:
+def gen_stat_plotly_fig(msg_df: pd.DataFrame,
+                        my_id: int,
+                        start_date=pd.Timestamp.min,
+                        end_date=pd.Timestamp.max,
+                        show_received=False) -> go.Figure:
     """
-    Generate plotly figure from dataframe with messages
-
+    Generate plotly figure from dataframe with messages.
     :param msg_df: dataframe with messages
     :param my_id: my id number
+    :param start_date: start date for plotting
+    :param end_date: end date for plotting
+    :param show_received: show received messages stats together with sent
     """
-
-    merged_df = gen_sent_received_dataframe(msg_df, my_id)
+    merged_df = gen_sent_received_dataframe(msg_df[(start_date <= msg_df['date']) &
+                                                   (msg_df['date'] <= end_date)], my_id)
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     fig.add_trace(go.Bar(x=merged_df.index.to_timestamp(), y=merged_df['chr_sent'], name='chr_sent'), secondary_y=False)
-    # fig.add_trace(go.Bar(x=merged_df.index.to_timestamp(), y=merged_df['chr_received'], name='chr_received'),
-    #               secondary_y=False)
+    if show_received:
+        fig.add_trace(go.Bar(x=merged_df.index.to_timestamp(), y=merged_df['chr_received'], name='chr_received'),
+                      secondary_y=False)
 
     fig.add_trace(go.Scatter(x=merged_df.index.to_timestamp(), y=merged_df['msg_sent'], name='msg'), secondary_y=True)
+
+    fig.update_layout(title="TG sent messages stats",
+                      yaxis_title="characters sent",
+                      font={"size": 20, "color": "black"})
+    fig.update_yaxes(title_text="messages sent", secondary_y=True)
     return fig
 
 
@@ -172,7 +194,10 @@ def main(path: str) -> None:
     my_id = load_my_id(path)
 
     df = gen_messages_dataframe(jdata, print_stats=True)
-    gen_stat_plotly_fig(df, my_id).show()
+    gen_stat_plotly_fig(df, my_id,
+                        start_date=pd.Timestamp('2021-01-01'),
+                        end_date=pd.Timestamp('2023-12-31'),
+                        show_received=True).show()
 
 
 if __name__ == '__main__':
